@@ -1,6 +1,7 @@
 package cl.duoc.andesstay.audit.controller;
 
 import cl.duoc.andesstay.audit.dto.AuditEventResponse;
+import cl.duoc.andesstay.audit.exception.InvalidAuditQueryException;
 import cl.duoc.andesstay.audit.repository.AuditEventRepository;
 import cl.duoc.andesstay.audit.repository.AuditEventSpecifications;
 import org.springframework.data.domain.Page;
@@ -23,6 +24,8 @@ import java.time.Instant;
 @RestController
 public class AuditController {
 
+    static final int MAX_PAGE_SIZE = 100;
+
     private final AuditEventRepository repository;
 
     public AuditController(AuditEventRepository repository) {
@@ -38,6 +41,16 @@ public class AuditController {
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int size
     ) {
+        if (page < 0) {
+            throw new InvalidAuditQueryException("page no puede ser negativo.");
+        }
+        if (size < 1 || size > MAX_PAGE_SIZE) {
+            throw new InvalidAuditQueryException("size debe estar entre 1 y " + MAX_PAGE_SIZE + ".");
+        }
+        if (desde != null && hasta != null && desde.isAfter(hasta)) {
+            throw new InvalidAuditQueryException("'desde' no puede ser posterior a 'hasta'.");
+        }
+
         var filtro = AuditEventSpecifications.conFiltros(usuario, tipoEvento, desde, hasta);
         var pageable = PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "occurredAt"));
 

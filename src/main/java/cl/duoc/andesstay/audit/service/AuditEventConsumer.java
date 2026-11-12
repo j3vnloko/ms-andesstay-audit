@@ -1,17 +1,31 @@
 package cl.duoc.andesstay.audit.service;
 
 import cl.duoc.andesstay.audit.dto.ReservationEventMessage;
+import cl.duoc.andesstay.audit.exception.InvalidEventException;
 import cl.duoc.andesstay.audit.model.AuditEvent;
 import cl.duoc.andesstay.audit.repository.AuditEventRepository;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
-import java.util.UUID;
 
+/**
+ * Consumer del topico "reservations.events" (definido en application.properties).
+ * Cada mensaje es un evento de negocio de una reserva (creada, confirmada,
+ * checkin, checkout, cancelada) y se guarda para trazabilidad.
+ *
+ * Manejo de errores (ver KafkaConsumerConfig):
+ *  - Mensaje invalido (JSON roto, sin eventId o sin type): InvalidEventException,
+ *    no se reintenta y va directo al topico DLT.
+ *  - Falla transitoria (ej: Postgres caido): la excepcion se propaga, se
+ *    reintenta 3 veces y, si sigue fallando, el mensaje va al DLT.
+ * Asi no se pierde ningun mensaje ni se bloquea el consumer.
+ */
 @Service
 public class AuditEventConsumer {
 
@@ -25,33 +39,32 @@ public class AuditEventConsumer {
         this.objectMapper = objectMapper;
     }
 
-    /**
-     * Escucha el topico "reservations.events" (definido en application.properties
-     * para poder cambiarlo sin recompilar). Cada mensaje representa un evento de
-     * negocio de una reserva (creada, confirmada, checkin, checkout, cancelada).
-     *
-     * Este consumer es deliberadamente tolerante a fallos: si un mensaje viene
-     * mal formado o le faltan campos, se loguea el error y se sigue, en vez de
-     * tumbar el consumer completo (eso dejaria de procesar TODOS los mensajes
-     * siguientes, que es peor que perder uno malo).
-     */
     @KafkaListener(
             topics = "${audit.kafka.topic}",
             groupId = "${spring.kafka.consumer.group-id}"
     )
     public void escuchar(String mensajeJson) {
-        try {
-            ReservationEventMessage evento = objectMapper.readValue(mensajeJson, ReservationEventMessage.class);
-            guardar(evento, mensajeJson);
-        } catch (Exception e) {
-            log.error("No se pudo procesar un mensaje de reservations.events. Payload crudo: {}", mensajeJson, e);
-        }
+        ReservationEventMessage evento = parsear(mensajeJson);
+        guardar(evento, mensajeJson);
     }
 
-    private void guardar(ReservationEventMessage evento, String payloadCrudo) {
+    private ReservationEventMessage parsear(String mensajeJson) {
+        ReservationEventMessage evento;
+        try {
+            evento = objectMapper.readValue(mensajeJson, ReservationEventMessage.class);
+        } catch (JsonProcessingException | IllegalArgumentException e) {
+            throw new InvalidEventException("El mensaje no es un JSON de evento valido.", e);
+        }
+        if (evento == null || isBlank(evento.getEventId()) || isBlank(evento.getType())) {
+            throw new InvalidEventException("El evento no trae eventId o type (envelope incompleto).");
+        }
+        return evento;
+    }
+
+    void guardar(ReservationEventMessage evento, String payloadCrudo) {
         // eventId es la clave de idempotencia: si Kafka reentrega el mismo
-        // mensaje (puede pasar, at-least-once delivery), no lo duplicamos.
-        String eventId = evento.getEventId() != null ? evento.getEventId() : UUID.randomUUID().toString();
+        // mensaje (at-least-once), no lo duplicamos.
+        String eventId = evento.getEventId();
 
         if (repository.existsByEventId(eventId)) {
             log.info("Evento {} ya estaba registrado, se ignora (idempotencia)", eventId);
@@ -60,7 +73,7 @@ public class AuditEventConsumer {
 
         AuditEvent registro = new AuditEvent();
         registro.setEventId(eventId);
-        registro.setEventType(evento.getType() != null ? evento.getType() : "DESCONOCIDO");
+        registro.setEventType(evento.getType());
         registro.setAggregateId(evento.getReservationId());
         registro.setActor(evento.getActor());
         registro.setOccurredAt(evento.getTimestamp() != null ? evento.getTimestamp() : Instant.now());
@@ -69,8 +82,18 @@ public class AuditEventConsumer {
         registro.setCorrelationId(evento.getCorrelationId());
         registro.setPayload(payloadCrudo);
 
-        repository.save(registro);
+        try {
+            repository.save(registro);
+        } catch (DataIntegrityViolationException e) {
+            // Dos entregas simultaneas del mismo evento: gano la otra (uk_audit_event_id).
+            log.info("Evento {} ya fue guardado por otra entrega, se ignora (idempotencia)", eventId);
+            return;
+        }
         log.info("Evento de auditoria guardado: tipo={}, reserva={}, actor={}",
                 registro.getEventType(), registro.getAggregateId(), registro.getActor());
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 }
