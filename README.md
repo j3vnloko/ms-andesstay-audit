@@ -1,73 +1,108 @@
 # ms-andesstay-audit
 
-Microservicio de auditoria del caso AndesStay (DSY1107 - Desarrollo Cloud Native I).
+Microservicio de auditoría del caso **AndesStay** (DSY1107 - Desarrollo Cloud Native I).
 
-Consume el topico Kafka `reservations.events` (publicado por `ms-andesstay-reservations`)
-y guarda cada evento para trazabilidad: quien hizo que, cuando, y desde que reserva.
-Expone un endpoint de solo lectura para consultarlos con filtros.
+Consume el tópico Kafka `reservations.events` (publicado por `ms-andesstay-reservations`),
+guarda cada evento en PostgreSQL para trazabilidad (quién hizo qué y cuándo) y expone un
+endpoint **de solo lectura** para consultarlos con filtros. Solo pueden verlo los roles
+**ADMIN** y **AUDITOR**.
+
+```
+ms-andesstay-reservations --publica--> Kafka "reservations.events" --consume--> ms-andesstay-audit --> PostgreSQL
+                                                                                       |
+                                                    mensajes con falla (tras 3 reintentos)
+                                                                                       v
+                                                              Kafka "reservations.events.audit.DLT"
+
+Angular --Bearer JWT--> API Gateway --> ms-andesstay-bff --> GET /api/audit
+```
 
 ## Stack
-- Java 17
-- Spring Boot 3.3.4 (Web, Data JPA, Validation, Security, OAuth2 Resource Server, Kafka)
+- Java 17, Spring Boot 3.3.4 (Web, Data JPA, Validation, Security, OAuth2 Resource Server, Kafka, Actuator)
 - PostgreSQL
-- Apache Kafka (consumer)
+- Apache Kafka (consumer, y producer solo para publicar en el DLT)
+- Micrometer + Prometheus (métricas en `/actuator/prometheus`)
 
-## Como correrlo local
+## Variables de entorno
+Copiar `.env.example` a `.env` (está en `.gitignore`, **nunca se sube al repositorio**).
 
-1. Levantar Kafka + Zookeeper (ver `infra/kafka/compose.yml` del proyecto):
-   ```
-   docker compose up -d
-   ```
+| Variable | Descripción | Valor por defecto |
+|---|---|---|
+| `DB_URL` | URL JDBC de PostgreSQL (RDS en AWS) | `jdbc:postgresql://localhost:5432/andesstay_audit` |
+| `DB_USERNAME` / `DB_PASSWORD` | Credenciales de la base | `postgres` / *(sin valor)* |
+| `KAFKA_BOOTSTRAP_SERVERS` | Brokers de Kafka | `localhost:9092` |
+| `KAFKA_TOPIC_REPLICAS` | Réplicas del tópico DLT (3 con el clúster de 3 brokers) | `1` |
+| `KAFKA_RETRY_ATTEMPTS` / `KAFKA_RETRY_INTERVAL_MS` | Reintentos antes de enviar al DLT | `3` / `1000` |
+| `COGNITO_REGION`, `COGNITO_USER_POOL_ID`, `COGNITO_APP_CLIENT_ID` | Mismo User Pool que catalog, reservations y BFF | — |
+| `FRONTEND_URL` | Origen permitido por CORS (varios separados por coma) | `http://localhost:4200` |
+| `SERVER_PORT` | Puerto del servicio | `8083` |
 
-2. Crear la base de datos (en pgAdmin o con psql):
-   ```
-   psql -U postgres -c "CREATE DATABASE andesstay_audit;"
-   ```
+## Cómo correrlo local
+1. Levantar Kafka + Zookeeper (`infra/kafka/compose.yml` del proyecto).
+2. Crear la base: `psql -U postgres -c "CREATE DATABASE andesstay_audit;"`
+3. Exportar `DB_PASSWORD` (y las demás variables si no usas los valores por defecto).
+4. Arrancar:
+   - **Sin Cognito** (perfil `nosec`, solo desarrollo; deja los endpoints abiertos):
+     `mvn spring-boot:run -Dspring-boot.run.profiles=nosec`
+   - **Con seguridad real**: exportar las variables de Cognito y ejecutar `mvn spring-boot:run`.
 
-3. Exportar la variable de la contrasena de Postgres:
-   - `DB_PASSWORD`
+> El perfil `nosec` **no se debe usar** en la demo ni en AWS.
 
-4a. **Sin Cognito todavia (perfil `nosec`, solo para desarrollo/pruebas):**
-   ```
-   mvn spring-boot:run -Dspring-boot.run.profiles=nosec
-   ```
-   Esto deja todos los endpoints abiertos, sin pedir token. Sirve para probar
-   que el consumer de Kafka y el guardado en Postgres funcionan, sin depender
-   de que el User Pool de Cognito ya exista.
-
-4b. **Con seguridad real (una vez creado el User Pool de Cognito):**
-   Exportar ademas `COGNITO_REGION`, `COGNITO_USER_POOL_ID`, `COGNITO_APP_CLIENT_ID`,
-   y ejecutar sin el flag de perfil:
-   ```
-   mvn spring-boot:run
-   ```
-
-El servicio queda arriba en `http://localhost:8083`.
+## Docker
+```bash
+docker build -t ms-andesstay-audit .
+docker run -d --name audit --env-file .env -p 8083:8083 ms-andesstay-audit
+```
+En la EC2, `KAFKA_BOOTSTRAP_SERVERS` debe apuntar a la IP privada del `ec2-kafka`.
 
 ## Endpoint
 
-| Metodo | Ruta | Descripcion | Roles |
+| Método | Ruta | Descripción | Roles |
 |---|---|---|---|
-| GET | `/api/audit` | Lista eventos de auditoria, paginado | ADMIN, AUDITOR |
+| GET | `/api/audit` | Lista eventos de auditoría, paginado (más recientes primero) | ADMIN, AUDITOR |
+| GET | `/actuator/health` | Estado del servicio (público, lo usa Docker/EC2) | — |
+| GET | `/actuator/prometheus` | Métricas para Prometheus (**no publicar en el API Gateway**) | — |
 
-Query params (todos opcionales): `usuario`, `tipoEvento`, `desde`, `hasta` (ISO-8601),
-`page`, `size`.
+Parámetros (todos opcionales): `usuario`, `tipoEvento`, `desde`, `hasta` (ISO-8601, ej. `2026-09-01T00:00:00Z`),
+`page` (≥ 0, por defecto 0) y `size` (1 a 100, por defecto 20).
 
-Ejemplo:
 ```
 GET /api/audit?tipoEvento=RESERVA_CONFIRMADA&desde=2026-09-01T00:00:00Z
 Authorization: Bearer <access_token>
 ```
 
-## Notas
+### Formato de errores (igual que el BFF y reservations)
+```json
+{ "timestamp": "2026-11-11T05:00:00Z", "status": 403, "error": "forbidden",
+  "message": "No tienes permisos (rol) suficientes para realizar esta operacion.", "path": "/api/audit" }
+```
+| Código | Cuándo |
+|---|---|
+| 400 | Filtros inválidos: fecha con mal formato, `desde` posterior a `hasta`, `size` fuera de rango |
+| 401 | Sin token, token vencido o emitido para otro `client_id` |
+| 403 | Token válido pero sin rol ADMIN o AUDITOR |
 
-- El consumer es idempotente: si Kafka reentrega un mensaje ya procesado (mismo
-  `eventId`), se ignora en vez de duplicarlo.
-- El formato exacto del mensaje que publica `ms-andesstay-reservations` puede cambiar
-  mientras ese microservicio se sigue construyendo; el consumer tolera campos
-  desconocidos y guarda el JSON crudo completo por si hace falta revisarlo.
-- Pendiente: reemplazar los valores `CHANGE_ME` una vez que el User Pool de Cognito
-  este creado.
+## Comportamiento del consumer
+- **Idempotente:** el `eventId` es único (`uk_audit_event_id`); si Kafka reentrega un evento, se ignora.
+- **Evento inválido** (JSON roto, sin `eventId` o sin `type`): no se reintenta y va directo al DLT.
+- **Falla transitoria** (ej. PostgreSQL caído): se reintenta 3 veces, 1 s entre intentos; si sigue
+  fallando, el mensaje va al DLT. **No se pierde ningún mensaje** y el consumer no se bloquea.
+- **DLT:** tópico `reservations.events.audit.DLT` (3 particiones), creado al arrancar. Los headers del
+  mensaje traen la excepción y el tópico/partición/offset de origen. Se puede revisar en Kafka UI.
+- Tolera campos nuevos en el evento (`@JsonIgnoreProperties(ignoreUnknown = true)`), por lo que
+  reservations puede agregar datos (ej. `unitId`) sin romper este servicio.
+
+## Seguridad
+- JWT de AWS Cognito: se validan firma, emisor (`iss`), `client_id` y vigencia.
+- Roles desde el claim `cognito:groups` → `ROLE_ADMIN`, `ROLE_AUDITOR`.
+- CORS para el frontend Angular según `FRONTEND_URL`.
+
+## Pruebas
+```bash
+mvn test
+```
+- `AuditSecurityTest`: 401/403/200 según rol, errores 400 en JSON, 404 en JSON y preflight CORS.
+- `AuditEventConsumerTest`: guardado, idempotencia, eventos inválidos y propagación de fallas.
 
 ## Equipo
 Jean Flores, Christian Fuentes, Emmanuel Valenzuela.
