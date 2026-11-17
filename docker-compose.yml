@@ -1,0 +1,44 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# docker-compose.yml — ms-andesstay-audit (Docker Desktop / Local)
+#
+# Comandos principales:
+#   docker compose up -d --build       # Construye y levanta en segundo plano
+#   docker compose logs -f audit-service # Ver logs en tiempo real
+#   docker compose ps                  # Ver estado del contenedor
+#   docker compose down                # Detener el servicio
+# ═══════════════════════════════════════════════════════════════════════════════
+
+services:
+  audit-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ms-andesstay-audit:latest
+    container_name: ms-andesstay-audit
+    restart: unless-stopped
+    ports:
+      - "${SERVER_PORT:-8083}:8083"
+    environment:
+      SERVER_PORT: ${SERVER_PORT:-8083}
+      DB_URL: ${DB_URL:-jdbc:postgresql://andesstay-notify-db:5432/andesstay_audit}
+      DB_USERNAME: ${DB_USERNAME:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka-1:29092,kafka-2:29093}
+      KAFKA_TOPIC_REPLICAS: ${KAFKA_TOPIC_REPLICAS:-1}
+      KAFKA_RETRY_ATTEMPTS: ${KAFKA_RETRY_ATTEMPTS:-3}
+      KAFKA_RETRY_INTERVAL_MS: ${KAFKA_RETRY_INTERVAL_MS:-1000}
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-nosec}
+      COGNITO_REGION: ${COGNITO_REGION:-us-east-1}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-CHANGE_ME}
+      COGNITO_APP_CLIENT_ID: ${COGNITO_APP_CLIENT_ID:-CHANGE_ME}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:4200,http://localhost:8080}
+      JAVA_OPTS: "-Xms128m -Xmx384m"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - andesstay-net
+
+networks:
+  andesstay-net:
+    external: true
+

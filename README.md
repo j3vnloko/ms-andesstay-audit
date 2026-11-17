@@ -49,6 +49,13 @@ Copiar `.env.example` a `.env` (está en `.gitignore`, **nunca se sube al reposi
 > El perfil `nosec` **no se debe usar** en la demo ni en AWS.
 
 ## Docker
+
+Con **Docker Compose** (recomendado para desarrollo local junto a la red `andesstay-net`):
+```bash
+docker compose up -d --build
+```
+
+O directamente con Docker CLI:
 ```bash
 docker build -t ms-andesstay-audit .
 docker run -d --name audit --env-file .env -p 8083:8083 ms-andesstay-audit
